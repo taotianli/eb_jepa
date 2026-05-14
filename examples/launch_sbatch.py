@@ -72,10 +72,10 @@ SLURM_DEFAULTS = {
     "mem_per_gpu": "210G",
     "cpus_per_task": 16,
     "timeout_min": 24 * 60,
-    "partition": "learn",
+    "partition": "gpu",       # update to your cluster partition
     "gpus_per_node": 1,
-    "qos": "lowest",
-    "account": "fair_amaia_cw_video",
+    "qos": "normal",          # update to your cluster QOS
+    "account": "u6da",        # update to your cluster account
 }
 
 
