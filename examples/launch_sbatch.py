@@ -69,13 +69,13 @@ from eb_jepa.training_utils import (
 
 # Default SLURM parameters
 SLURM_DEFAULTS = {
-    "mem_per_gpu": "210G",
-    "cpus_per_task": 16,
+    "mem_per_gpu": "0",       # mem=0 means use all available memory on the node
+    "cpus_per_task": 8,
     "timeout_min": 24 * 60,
-    "partition": "gpu",       # update to your cluster partition
+    "partition": "gpu",
     "gpus_per_node": 1,
-    "qos": "normal",          # update to your cluster QOS
-    "account": "u6da",        # update to your cluster account
+    "qos": "normal",
+    "account": "u6da",
 }
 
 
