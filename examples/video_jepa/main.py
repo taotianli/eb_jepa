@@ -22,6 +22,7 @@ from eb_jepa.architectures import (
     StateOnlyPredictor,
 )
 from eb_jepa.datasets.moving_mnist import MovingMNISTDet
+from eb_jepa.ema import build_ema
 from eb_jepa.image_decoder import ImageDecoder
 from eb_jepa.jepa import JEPA, JEPAProbe
 from eb_jepa.logging import get_logger
@@ -44,6 +45,53 @@ from eb_jepa.training_utils import (
 from examples.video_jepa.eval import validation_loop
 
 logger = get_logger(__name__)
+
+
+def _ema_kwargs(ema_type: str, ema_cfg, total_steps: int) -> dict:
+    """Extract only the kwargs relevant to the chosen EMA type."""
+    c = ema_cfg  # OmegaConf node or dict
+    get = lambda k, d: c.get(k, d) if hasattr(c, "get") else c.get(k, d)
+
+    shared = {"init_momentum": get("init_momentum", 0.996)}
+
+    if ema_type == "standard":
+        return {"momentum": get("momentum", shared["init_momentum"])}
+
+    if ema_type == "scheduled":
+        return {
+            "m_start": get("m_start", 0.996),
+            "m_end": get("m_end", 1.0),
+            "total_steps": total_steps,
+        }
+
+    if ema_type in ("kalman", "kalman_per_layer"):
+        return {
+            **shared,
+            "q_momentum": get("q_momentum", 0.99),
+            "r_momentum": get("r_momentum", 0.99),
+            "min_gain": get("min_gain", 1e-4),
+            "max_gain": get("max_gain", 0.5),
+        }
+
+    if ema_type == "gradient_adaptive":
+        return {
+            "base_momentum": shared["init_momentum"],
+            "grad_momentum": get("grad_momentum", 0.99),
+            "min_momentum": get("min_momentum", 0.9),
+            "max_momentum": get("max_momentum", 0.9999),
+        }
+
+    if ema_type == "double":
+        return {"momentum": get("momentum", shared["init_momentum"])}
+
+    if ema_type == "layerwise":
+        return {
+            "m_min": get("m_min", 0.99),
+            "m_max": get("m_max", 0.9999),
+            "alpha": get("alpha", 2.0),
+        }
+
+    return {}
 
 
 def run(
@@ -127,13 +175,28 @@ def run(
 
     # Initialize Video JEPA model
     logger.info("Initializing model...")
-    encoder = ResNet5(cfg.model.dobs, cfg.model.henc, cfg.model.dstc)
+    context_encoder = ResNet5(cfg.model.dobs, cfg.model.henc, cfg.model.dstc)
+    target_encoder = ResNet5(cfg.model.dobs, cfg.model.henc, cfg.model.dstc)
+    for p in target_encoder.parameters():
+        p.requires_grad_(False)
+
     predictor_model = ResUNet(2 * cfg.model.dstc, cfg.model.hpre, cfg.model.dstc)
     predictor = StateOnlyPredictor(predictor_model, context_length=2)
     projector = Projector(f"{cfg.model.dstc}-{cfg.model.dstc*4}-{cfg.model.dstc*4}")
     regularizer = VCLoss(cfg.loss.std_coeff, cfg.loss.cov_coeff, proj=projector)
     ploss = SquareLossSeq(projector)
-    jepa = JEPA(encoder, encoder, predictor, regularizer, ploss).to(device)
+    # context_encoder is trained; target_encoder is updated via EMA only
+    jepa = JEPA(context_encoder, target_encoder, predictor, regularizer, ploss).to(device)
+
+    # Build EMA updater — syncs target_encoder weights from context_encoder
+    ema_cfg = cfg.get("ema", {})
+    ema_type = ema_cfg.get("type", "standard")
+    total_steps = cfg.optim.epochs * len(
+        DataLoader(MovingMNISTDet(split="train"), batch_size=cfg.data.batch_size)
+    )
+    ema_kwargs = _ema_kwargs(ema_type, ema_cfg, total_steps)
+    ema = build_ema(ema_type, context_encoder, target_encoder, **ema_kwargs)
+    logger.info(f"EMA type: {ema_type}  kwargs: {ema_kwargs}")
 
     # Initialize decoder and detection head (for evaluation only)
     decoder = ImageDecoder(cfg.model.dstc, cfg.model.dobs)
@@ -142,7 +205,7 @@ def run(
     detection_head = JEPAProbe(jepa, dethead, nn.BCELoss()).to(device)
 
     # Log model structure and parameters
-    encoder_params = sum(p.numel() for p in encoder.parameters())
+    encoder_params = sum(p.numel() for p in context_encoder.parameters())
     predictor_params = sum(p.numel() for p in predictor.parameters())
     log_model_info(jepa, {"encoder": encoder_params, "predictor": predictor_params})
 
@@ -150,11 +213,12 @@ def run(
     detection_head.train()
     pixel_decoder.train()
 
-    # Set learning rates for different components
-    # Lower learning rate for pixel decoder to prevent overfitting
+    # target_encoder is not optimised — exclude from optimizer
     optimizer = Adam(
         [
-            {"params": jepa.parameters(), "lr": cfg.optim.lr},
+            {"params": context_encoder.parameters(), "lr": cfg.optim.lr},
+            {"params": predictor.parameters(), "lr": cfg.optim.lr},
+            {"params": projector.parameters(), "lr": cfg.optim.lr},
             {"params": pixel_decoder.head.parameters(), "lr": cfg.optim.lr / 10},
             {"params": detection_head.head.parameters(), "lr": cfg.optim.lr},
         ]
@@ -171,9 +235,12 @@ def run(
         ckpt_info = load_checkpoint(ckpt_path, jepa, optimizer, device=device)
         start_epoch = ckpt_info.get("epoch", 0)
         global_step = ckpt_info.get("step", 0)
+        if "ema_state" in ckpt_info:
+            ema.load_state_dict(ckpt_info["ema_state"])
 
     # Training loop
     logger.info(f"Starting training for {cfg.optim.epochs} epochs...")
+    ema_stats = {}
 
     for epoch in range(start_epoch, cfg.optim.epochs):
         pbar = tqdm(
@@ -203,12 +270,20 @@ def run(
             total_loss.backward()
             optimizer.step()
 
+            # Collect gradients for noise-aware EMA variants (K-EMA, gradient-adaptive)
+            named_grads = {
+                name: (p.grad.detach().clone() if p.grad is not None else None)
+                for name, p in context_encoder.named_parameters()
+            }
+            ema_stats = ema.step(named_grads=named_grads)
+
             # Update progress bar
             pbar.set_postfix(
                 {
                     "loss": f"{jepa_loss.item():.4f}",
                     "vc": f"{regl.item():.4f}",
                     "pred": f"{pl.item():.4f}",
+                    "ema_m": f"{ema_stats.get('equiv_momentum', 0):.4f}",
                 }
             )
 
@@ -230,6 +305,8 @@ def run(
             }
             for k, v in regldict.items():
                 train_metrics[f"train/{k}"] = float(v)
+            for k, v in ema_stats.items():
+                train_metrics[f"ema/{k}"] = float(v)
 
             all_metrics = {**train_metrics, **val_logs}
 
@@ -245,17 +322,19 @@ def run(
                     "vc": regl.item(),
                     "pred": pl.item(),
                     "val_recon": val_logs.get("val/recon_loss", 0),
+                    "ema_m": ema_stats.get("equiv_momentum", 0),
                 },
                 total_epochs=cfg.optim.epochs,
             )
 
-        # Save checkpoint
+        # Save checkpoint (include EMA internal state for resumability)
         save_checkpoint(
             exp_dir / "latest.pth.tar",
             model=jepa,
             optimizer=optimizer,
             epoch=epoch,
             step=global_step,
+            ema_state=ema.state_dict(),
         )
         if epoch % cfg.logging.save_every == 0 and epoch > 0:
             save_checkpoint(
@@ -264,6 +343,7 @@ def run(
                 optimizer=optimizer,
                 epoch=epoch,
                 step=global_step,
+                ema_state=ema.state_dict(),
             )
 
     if wandb_run:

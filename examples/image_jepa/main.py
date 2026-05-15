@@ -31,6 +31,7 @@ from torchvision.datasets import CIFAR10
 from torchvision.models import VisionTransformer
 from tqdm import tqdm
 
+from eb_jepa.ema import build_ema
 from eb_jepa.logging import get_logger
 from eb_jepa.losses import BCS, VICRegLoss
 from eb_jepa.training_utils import (
@@ -56,6 +57,46 @@ from examples.image_jepa.dataset import (
 from examples.image_jepa.eval import LinearProbe, evaluate_linear_probe
 
 logger = get_logger(__name__)
+
+
+def _ema_kwargs(ema_type: str, ema_cfg, total_steps: int) -> dict:
+    """Extract only the kwargs relevant to the chosen EMA type."""
+    get = lambda k, d: ema_cfg.get(k, d) if hasattr(ema_cfg, "get") else d
+
+    shared = {"init_momentum": get("init_momentum", 0.996)}
+
+    if ema_type == "standard":
+        return {"momentum": get("momentum", shared["init_momentum"])}
+    if ema_type == "scheduled":
+        return {
+            "m_start": get("m_start", 0.996),
+            "m_end": get("m_end", 1.0),
+            "total_steps": total_steps,
+        }
+    if ema_type in ("kalman", "kalman_per_layer"):
+        return {
+            **shared,
+            "q_momentum": get("q_momentum", 0.99),
+            "r_momentum": get("r_momentum", 0.99),
+            "min_gain": get("min_gain", 1e-4),
+            "max_gain": get("max_gain", 0.5),
+        }
+    if ema_type == "gradient_adaptive":
+        return {
+            "base_momentum": shared["init_momentum"],
+            "grad_momentum": get("grad_momentum", 0.99),
+            "min_momentum": get("min_momentum", 0.9),
+            "max_momentum": get("max_momentum", 0.9999),
+        }
+    if ema_type == "double":
+        return {"momentum": get("momentum", shared["init_momentum"])}
+    if ema_type == "layerwise":
+        return {
+            "m_min": get("m_min", 0.99),
+            "m_max": get("m_max", 0.9999),
+            "alpha": get("alpha", 2.0),
+        }
+    return {}
 
 
 class ResNet18(nn.Module):
@@ -257,6 +298,7 @@ def train_epoch(
     device,
     epoch,
     loss_fn,
+    ema=None,
     use_amp=True,
     dtype=torch.float16,
     tqdm_silent=False,
@@ -270,6 +312,7 @@ def train_epoch(
     total_linear_loss = 0
     linear_correct = 0
     linear_total = 0
+    ema_stats_accum = {}
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch}", disable=tqdm_silent)
     for batch_idx, (views, target) in enumerate(pbar):
@@ -300,6 +343,16 @@ def train_epoch(
         scaler.step(optimizer)
         scaler.update()
 
+        # Update target encoder via EMA after each optimizer step
+        if ema is not None:
+            named_grads = {
+                name: (p.grad.detach().clone() if p.grad is not None else None)
+                for name, p in model.backbone.named_parameters()
+            }
+            step_stats = ema.step(named_grads=named_grads)
+            for k, v in step_stats.items():
+                ema_stats_accum[k] = ema_stats_accum.get(k, 0.0) + float(v)
+
         # Update metrics dynamically based on loss_dict keys
         for key, value in loss_dict.items():
             if key not in loss_totals:
@@ -312,13 +365,14 @@ def train_epoch(
         linear_correct += linear_correct_batch
 
         # Update progress bar
-        pbar.set_postfix(
-            {
-                "Loss": f"{loss.item():.4f}",
-                "Linear": f"{linear_loss.item():.4f}",
-                "Acc": f"{100.*linear_correct/linear_total:.2f}%",
-            }
-        )
+        postfix = {
+            "Loss": f"{loss.item():.4f}",
+            "Linear": f"{linear_loss.item():.4f}",
+            "Acc": f"{100.*linear_correct/linear_total:.2f}%",
+        }
+        if ema is not None and "equiv_momentum" in step_stats:
+            postfix["EMA_m"] = f"{step_stats['equiv_momentum']:.4f}"
+        pbar.set_postfix(postfix)
 
     # Update learning rate
     scheduler.step(epoch)
@@ -328,6 +382,8 @@ def train_epoch(
     metrics = {key: total / num_batches for key, total in loss_totals.items()}
     metrics["linear_loss"] = total_linear_loss / num_batches
     metrics["linear_acc"] = 100.0 * linear_correct / linear_total
+    for k, v in ema_stats_accum.items():
+        metrics[f"ema/{k}"] = v / num_batches
 
     return metrics
 
@@ -434,6 +490,7 @@ def run(
     logger.info("Initializing model...")
     if cfg.model.type == "resnet":
         backbone = ResNet18()
+        target_backbone = ResNet18()
         features_dim = backbone.features_dim
     elif cfg.model.type == "vit_s":
         features_dim = 384
@@ -447,6 +504,8 @@ def run(
         )
         backbone = VisionTransformer(**model_kwargs)
         backbone.heads = nn.Identity()
+        target_backbone = VisionTransformer(**model_kwargs)
+        target_backbone.heads = nn.Identity()
     elif cfg.model.type == "vit_b":
         features_dim = 768
         model_kwargs = dict(
@@ -459,6 +518,13 @@ def run(
         )
         backbone = VisionTransformer(**model_kwargs)
         backbone.heads = nn.Identity()
+        target_backbone = VisionTransformer(**model_kwargs)
+        target_backbone.heads = nn.Identity()
+
+    # target_backbone is updated only via EMA — no gradients
+    for p in target_backbone.parameters():
+        p.requires_grad_(False)
+    target_backbone = target_backbone.to(device)
 
     model = ImageSSL(
         backbone,
@@ -471,6 +537,14 @@ def run(
         model.projector = nn.Identity()
 
     model = model.to(device)
+
+    # Build EMA updater (online=backbone, target=target_backbone)
+    ema_cfg = cfg.get("ema", {})
+    ema_type = ema_cfg.get("type", "standard") if ema_cfg else "standard"
+    total_steps = cfg.optim.epochs * len(train_loader)
+    ema_kwargs = _ema_kwargs(ema_type, ema_cfg, total_steps)
+    ema = build_ema(ema_type, backbone, target_backbone, **ema_kwargs)
+    logger.info(f"EMA type: {ema_type}  kwargs: {ema_kwargs}")
 
     # Log model structure and parameters
     encoder_params = sum(p.numel() for p in backbone.parameters())
@@ -497,7 +571,7 @@ def run(
     optimizer = LARS(
         [
             {"params": model.parameters(), "lr": cfg.optim.lr},
-            {"params": linear_probe.parameters(), "lr": 0.1},  # Linear probe parameters
+            {"params": linear_probe.parameters(), "lr": 0.1},
         ],
         weight_decay=cfg.optim.weight_decay,
         eta=0.02,
@@ -529,6 +603,8 @@ def run(
         start_epoch = ckpt_info.get("epoch", 0)
         if "linear_probe_state_dict" in ckpt_info:
             linear_probe.load_state_dict(ckpt_info["linear_probe_state_dict"])
+        if "ema_state" in ckpt_info:
+            ema.load_state_dict(ckpt_info["ema_state"])
 
     # Training loop
     logger.info(f"Starting training for {cfg.optim.epochs} epochs...")
@@ -548,9 +624,10 @@ def run(
             device,
             epoch,
             loss_fn,
-            use_amp,
-            dtype,
-            tqdm_silent,
+            ema=ema,
+            use_amp=use_amp,
+            dtype=dtype,
+            tqdm_silent=tqdm_silent,
         )
 
         # Evaluate linear probe on validation set
@@ -583,7 +660,7 @@ def run(
                 elapsed_time=elapsed,
             )
 
-        # Save checkpoint
+        # Save checkpoint (include EMA state for resumability)
         save_checkpoint(
             exp_dir / "latest.pth.tar",
             model=model,
@@ -592,6 +669,7 @@ def run(
             scaler=scaler,
             linear_probe_state_dict=linear_probe.state_dict(),
             linear_val_acc=val_acc,
+            ema_state=ema.state_dict(),
         )
         if epoch % cfg.logging.save_every == 0 and epoch > 0:
             save_checkpoint(
@@ -602,6 +680,7 @@ def run(
                 scaler=scaler,
                 linear_probe_state_dict=linear_probe.state_dict(),
                 linear_val_acc=val_acc,
+                ema_state=ema.state_dict(),
             )
 
     logger.info("Training completed!")

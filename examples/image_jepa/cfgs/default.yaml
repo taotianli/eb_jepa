@@ -47,6 +47,32 @@ training:
   use_amp: true      # Use automatic mixed precision
   dtype: bfloat16     # float16 or bfloat16
 
+# Target encoder EMA configuration
+# ema.type choices: standard | scheduled | kalman | kalman_per_layer |
+#                   gradient_adaptive | double | layerwise
+ema:
+  type: kalman          # A3: Kalman EMA (proposed)
+  # shared
+  init_momentum: 0.996
+  # kalman / kalman_per_layer
+  q_momentum: 0.99
+  r_momentum: 0.99
+  min_gain: 1.0e-4
+  max_gain: 0.5
+  # scheduled
+  m_start: 0.996
+  m_end: 1.0
+  # gradient_adaptive
+  grad_momentum: 0.99
+  min_momentum: 0.9
+  max_momentum: 0.9999
+  # double / standard
+  momentum: 0.996
+  # layerwise
+  m_min: 0.99
+  m_max: 0.9999
+  alpha: 2.0
+
 # --- Parameters used when running with --full-sweep
 # By default, only the parameters specified above are used
 sweep:
