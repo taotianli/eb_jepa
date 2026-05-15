@@ -689,4 +689,30 @@ def run(
 
 
 if __name__ == "__main__":
-    fire.Fire(run)
+    import sys
+
+    args = sys.argv[1:]
+    fname = "examples/image_jepa/cfgs/default.yaml"
+    overrides = {}
+    remaining = []
+    for a in args:
+        if "=" in a and not a.startswith("-"):
+            k, v = a.split("=", 1)
+            # try to cast to int/float/bool, else keep as string
+            for cast in (int, float):
+                try:
+                    v = cast(v)
+                    break
+                except ValueError:
+                    pass
+            if v == "true":
+                v = True
+            elif v == "false":
+                v = False
+            overrides[k] = v
+        else:
+            remaining.append(a)
+    # remaining positional: first is fname if provided
+    if remaining:
+        fname = remaining[0]
+    run(fname=fname, **overrides)
